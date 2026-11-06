@@ -1,0 +1,66 @@
+name: RWA Radar — twice-daily research
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub cron is UTC: 23:30 UTC = next-day 08:30 KST; 08:00 UTC = 17:00 KST.
+    - cron: '30 23 * * *'
+    - cron: '0 8 * * *'
+
+# Deliberate owner activation is required. No secrets or personal notes go in the public feed.
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: rwa-radar-research
+  cancel-in-progress: false
+
+jobs:
+  research:
+    if: github.event_name == 'workflow_dispatch' || vars.RADAR_ENABLE_SCHEDULE == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check Pages activation
+        uses: actions/configure-pages@v5
+      - name: Test collector invariants before any requests
+        run: python -m unittest discover -s automation -p 'test_*.py' -v
+      - name: Collect public research
+        run: python automation/collector.py
+      - name: Preserve observation history in Git (never force-push)
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git config user.name 'rwa-radar-automation'
+          git config user.email 'rwa-radar-automation@users.noreply.github.com'
+          git add .monitor-state/state.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'data: update public RWA research observations'
+            git pull --rebase origin "$DEFAULT_BRANCH"
+            git push origin "HEAD:$DEFAULT_BRANCH"
+          fi
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public-feed
+      - name: Publish read-only public feed
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Show website connection URL
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          echo '## RWA Radar feed' >> "$GITHUB_STEP_SUMMARY"
+          echo "Website connection URL: ${PAGE_URL%/}/monitor-feed.json" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Schedule: 08:30 / 17:00 Asia/Seoul (best effort, not an exact-time SLA).' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Manual review remains necessary for search candidates, missing dates, ambiguous regions and failed sources.' >> "$GITHUB_STEP_SUMMARY"
