@@ -2,6 +2,12 @@ name: RWA Radar — twice-daily research
 
 on:
   workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Optional public page URL. Empty = full monitoring. URL/results become public.'
+        required: false
+        default: ''
+        type: string
   schedule:
     # GitHub cron is UTC: 23:30 UTC = next-day 08:30 KST; 08:00 UTC = 17:00 KST.
     - cron: '30 23 * * *'
@@ -37,6 +43,8 @@ jobs:
       - name: Test collector invariants before any requests
         run: python -m unittest discover -s automation -p 'test_*.py' -v
       - name: Collect public research
+        env:
+          RADAR_TARGET_URL: ${{ inputs.target_url }}
         run: python automation/collector.py
       - name: Preserve observation history in Git (never force-push)
         env:
