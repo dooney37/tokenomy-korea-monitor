@@ -4,6 +4,7 @@ Never runs inside the static website. Official structured dates are not human ve
 from __future__ import annotations
 import concurrent.futures
 import datetime as dt
+import difflib
 import hashlib
 import ipaddress
 import json
@@ -46,10 +47,19 @@ class SafeRedirect(request.HTTPRedirectHandler):
         public_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
+class TargetRedirect(SafeRedirect):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # The redirected path may have different robots rules. Ask for the final URL
+        # instead of fetching it before checking those rules.
+        raise ValueError('Target redirected: submit the final public browser URL directly')
+
+
 class Fetcher:
     def __init__(self, config):
         self.config = config
         self.robots = {}
+        self.robot_errors = {}
+        self.responses = {}
         self.lock = threading.Lock()
         self.opener = request.build_opener(SafeRedirect())
         self.last = {}
@@ -69,6 +79,10 @@ class Fetcher:
         origin = f'{p.scheme}://{p.netloc}'
         # Serialize per-host robot discovery and spacing; never bypass robots or a 401/403.
         with self.lock:
+            if url in self.responses:
+                return self.responses[url]
+            if origin in self.robot_errors:
+                raise ValueError(self.robot_errors[origin])
             if origin not in self.robots:
                 rp = robotparser.RobotFileParser()
                 try:
@@ -80,7 +94,11 @@ class Fetcher:
                         rp.parse([])
                         self.robots[origin] = rp
                     else:
-                        raise ValueError(f'robots unavailable: HTTP {exc.code}') from exc
+                        self.robot_errors[origin] = f'robots unavailable: HTTP {exc.code}'
+                        raise ValueError(self.robot_errors[origin]) from exc
+                except Exception as exc:
+                    self.robot_errors[origin] = 'robots unavailable: '+str(exc)[:160]
+                    raise ValueError(self.robot_errors[origin]) from exc
             rp = self.robots[origin]
             if not rp.can_fetch(self.config['user_agent'], url):
                 raise ValueError('robots.txt disallows this URL')
@@ -91,7 +109,10 @@ class Fetcher:
             if delay > 60:
                 raise ValueError('crawl-delay too long for this scheduled job')
             self.last[origin] = time.monotonic()
-        return self.raw(url)
+        result = self.raw(url)
+        with self.lock:
+            self.responses[url] = result
+        return result
 
 class EventHTML(HTMLParser):
     def __init__(self):
@@ -104,6 +125,7 @@ class EventHTML(HTMLParser):
         self.anchor = None
         self.title = ''
         self.in_title = False
+        self.feeds = []
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -115,6 +137,8 @@ class EventHTML(HTMLParser):
             self.hidden += 1
         if tag == 'title':
             self.in_title = True
+        if tag == 'link' and 'alternate' in attrs.get('rel', '').lower() and attrs.get('type', '').lower() in ('application/rss+xml', 'application/atom+xml'):
+            self.feeds.append(attrs.get('href', ''))
         if tag == 'a':
             self.anchor = [attrs.get('href', ''), []]
 
@@ -231,7 +255,9 @@ def structured_item(event, source, page_url, plan, timestamp):
         if isinstance(person_types, str):
             person_types = [person_types]
         if isinstance(person, dict) and isinstance(person.get('name'), str) and any(str(t).split('/')[-1] == 'Person' for t in person_types):
-            aff = person.get('affiliation', {})
+            aff = person.get('affiliation') or person.get('worksFor', {})
+            if isinstance(aff, list):
+                aff = aff[0] if aff else {}
             item['speakers'].append({'name': str(person['name'])[:120], 'company': str(aff.get('name', ''))[:160] if isinstance(aff, dict) else '', 'role': str(person.get('jobTitle', ''))[:120], 'url': page_url})
     if item['speakers']:
         item['kind'] = '스피커 공개'
@@ -346,11 +372,354 @@ def collect_direct(source, fetcher, plan, timestamp, previous_hashes):
     return items, checks, hashes
 
 
+def recover_title_links(title, original_url, fetcher, timestamp):
+    """One bounded public-API title requery; actual mirror access/title must match."""
+    phrase = re.sub(r'[\"()\\\\]', ' ', title)[:140]
+    query_url = 'https://api.gdeltproject.org/api/v2/doc/doc?' + parse.urlencode({'query':'"'+normalized(phrase)+'"','mode':'ArtList','format':'json','maxrecords':5,'timespan':'3months'})
+    links, checks = [], []
+    try:
+        time.sleep(5)
+        text, _, _ = fetcher.get(query_url)
+        value = json.loads(text)
+        if not isinstance(value,dict) or ('articles' not in value and value) or not isinstance(value.get('articles',[]),list):
+            raise ValueError('Unexpected title search response')
+        checks.append({'id':'title-query-'+digest(title),'name':title[:100],'url':query_url,'status':'ok','method':'title_requery','checked_at':timestamp})
+        tested = 0
+        for article in value.get('articles',[]):
+            href = str(article.get('url',''))
+            headline = normalized(str(article.get('title','')))
+            if href==original_url or parse.urlsplit(href).scheme not in ('http','https') or difflib.SequenceMatcher(None,title.casefold(),headline.casefold()).ratio()<0.75:
+                continue
+            if tested >= 2:
+                break
+            tested += 1
+            try:
+                body,mime,final_url=fetcher.get(href)
+                if mime not in ('text/html','application/xhtml+xml'):
+                    raise ValueError('Mirror is not supported HTML')
+                page=EventHTML();page.feed(body)
+                if difflib.SequenceMatcher(None,title.casefold(),normalized(page.title).casefold()).ratio()<0.65:
+                    raise ValueError('Accessible page title did not match the original headline')
+                links.append({'url':final_url,'title':normalized(page.title)[:200],'checked_at':timestamp,'method':'gdelt_title_requery','status':'title_match_accessible'})
+                checks.append({'id':'title-mirror-'+digest(href),'name':title[:100],'url':href,'status':'ok','method':'title_mirror','checked_at':timestamp})
+            except Exception as exc:
+                checks.append({'id':'title-mirror-'+digest(href),'name':title[:100],'url':href,'status':'failed','method':'title_mirror','checked_at':timestamp,'error':str(exc)[:200]})
+    except Exception as exc:
+        checks.append({'id':'title-query-'+digest(title),'name':title[:100],'url':query_url,'status':'failed','method':'title_requery','checked_at':timestamp,'error':str(exc)[:200]})
+    return links,checks
+
+
+def collect_public_news(query, fetcher, plan, timestamp):
+    """Optional public, keyless GDELT Doc API. Separate coverage, not Google RSS bypass.
+    API titles remain unverified; original article access is checked independently.
+    """
+    config = plan.get('public_news_api', {})
+    url = 'https://api.gdeltproject.org/api/v2/doc/doc?' + parse.urlencode({'query':query,'mode':'ArtList','format':'json','maxrecords':min(20,int(config.get('max_records',10))),'timespan':'3months'})
+    text, _, _ = fetcher.get(url)
+    result = json.loads(text)
+    if not isinstance(result, dict) or ('articles' not in result and result):
+        raise ValueError('Unexpected public news API response')
+    articles = result.get('articles', [])
+    if not isinstance(articles, list):
+        raise ValueError('Public API articles must be a list')
+    items, checks = [], []
+    max_origins = int(config.get('max_article_checks', 3))
+    title_retries = 0
+    for index, article in enumerate(articles[:min(10, int(config.get('max_records',10)))]):
+        title = normalized(str(article.get('title','')))
+        href = str(article.get('url',''))
+        p = parse.urlsplit(href)
+        if not title or excluded(title,plan) or p.scheme not in ('http','https') or p.username or p.password:
+            continue
+        accessed, access_error = False, '이번 회차 원문 접근 확인 예산 밖'
+        snippet = ''
+        if index < max_origins:
+            try:
+                body, mime, final_url = fetcher.get(href)
+                if mime not in ('text/html','application/xhtml+xml'):
+                    raise ValueError('Original article is not supported HTML')
+                page = EventHTML();page.feed(body)
+                snippet = normalized(' '.join(page.text))[:350]
+                accessed, access_error = True, ''
+                checks.append({'id':'news-origin-'+digest(href),'name':title[:100],'url':href,'status':'ok','method':'news_origin','checked_at':timestamp})
+            except Exception as exc:
+                access_error = str(exc)[:220]
+                checks.append({'id':'news-origin-'+digest(href),'name':title[:100],'url':href,'status':'failed','method':'news_origin','checked_at':timestamp,'error':access_error})
+        alternatives = []
+        if not accessed and index < max_origins and title_retries < int(config.get('title_retry_limit',1)):
+            title_retries += 1
+            alternatives, rows = recover_title_links(title, href, fetcher, timestamp)
+            checks.extend(rows)
+        watch = next((s for s in plan['watchlist'] if any(len(a)>3 and a.casefold() in title.casefold() for a in s['aliases'])), None)
+        reasons=['공개 뉴스 API 제목 후보: 공식 근거·개최연도·지역·금융 연관성 검수 필요']
+        if not accessed:
+            reasons.append('원문 접근 미확인: '+access_error)
+        items.append({'id':'news-'+digest(href),'title':title,'url':href,'source_url':href,
+                      'watch_id':watch['id'] if watch else 'public-news','watch_name':watch['name'] if watch else '공개 뉴스 API 탐색',
+                      'priority':watch['priority'] if watch else 'B','region':'현행 개최지 미확인','historical_region':watch['region'] if watch else '미확인',
+                      'event_date':'','end_date':'','source_kind':'news_discovery','kind':'대체 뉴스 발견',
+                      'review_required':True,'review_reasons':reasons,'scope':'unknown','summary':('공개 API 제목 · '+str(article.get('domain',''))+' · '+snippet)[:600],
+                      'published_at':str(article.get('seendate','')),'speakers':[],'observed_at':timestamp,'retrieval_method':'gdelt_doc_api',
+                      'original_access':accessed,'alternate_links':alternatives,'evidence':'GDELT 공개 Doc API 검색 후보. 기사 원문 접근과 공식 행사 사실 확인은 별개. 게시 시각을 행사일로 사용하지 않음.'})
+    checks.insert(0,{'id':'news-api-'+digest(query),'name':'GDELT 공개 뉴스 API','url':url,'status':'ok','method':'news_api','checked_at':timestamp,'count':len(items)})
+    return items, checks, {'provider':'GDELT Doc API','query':query,'status':'ok','count':len(items),'originals_accessed':sum(x['original_access'] for x in items),'note':'별도 뉴스 색인 범위의 후보 탐색. 전체 뉴스·Google RSS 복구를 뜻하지 않음.'}
+
+
+def candidate_link_score(url, label, source, titles=()):
+    value = (parse.unquote(url) + ' ' + label).casefold()
+    score = 5 if '2027' in value else 0
+    if re.search(r'speaker|agenda|program|conference|summit|forum|登壇|講演|嘉賓|嘉宾|포럼|연사', value):
+        score += 4
+    if re.search(r'news|events|공지|소식', value):
+        score += 2
+    terms = source.get('aliases', []) + [source.get('name', '')] + list(titles)[:12]
+    if any(len(t) > 3 and t.casefold() in value for t in terms):
+        score += 8
+    return score
+
+
+def allowed_same_site(url, origin):
+    try:
+        p = parse.urlsplit(url)
+        base = parse.urlsplit(origin)
+        host = (p.hostname or '').lower().removeprefix('www.')
+        base_host = (base.hostname or '').lower().removeprefix('www.')
+        return p.scheme in ('http', 'https') and host == base_host and not p.username and not p.password and p.port in (None, 80, 443)
+    except ValueError:
+        return False
+
+
+def xml_locations(text):
+    root = ET.fromstring(text)
+    is_index = root.tag.split('}')[-1] == 'sitemapindex'
+    return is_index, [node.text.strip() for node in root.iter() if node.tag.split('}')[-1] == 'loc' and node.text][:2000]
+
+
+def feed_links(text):
+    root = ET.fromstring(text)
+    links = []
+    for node in root.iter():
+        tag = node.tag.split('}')[-1]
+        if tag not in ('item', 'entry'):
+            continue
+        title = next((c.text or '' for c in node if c.tag.split('}')[-1] == 'title'), '')
+        href = next((c.get('href') or c.text or '' for c in node if c.tag.split('}')[-1] == 'link'), '')
+        if href:
+            links.append((href.strip(), normalized(title)))
+    return links[:100]
+
+
+def collect_recovery(source, fetcher, plan, timestamp, previous_items):
+    """Bounded search WITHIN known source sites, not a search-engine or robots bypass.
+    A failed RSS query contains no recovered article title. Only known brands and
+    titles of previously fetched documents can guide this fallback.
+    """
+    config = plan.get('recovery', {})
+    budget = min(12, int(config.get('max_requests_per_group', 7)))
+    max_matches = min(8, int(config.get('max_matches_per_group', 3)))
+    checks, items, checked, queue, maps, matches = [], [], set(), [], [], []
+    source_url = source['url']
+    parsed = parse.urlsplit(source_url)
+    origin = f'{parsed.scheme}://{parsed.netloc}'
+    titles = [x.get('title', '') for x in previous_items if x.get('watch_id') == source['id']]
+    seeds = [source_url]
+    seeds += [u for u in source.get('fallback_urls', []) if allowed_same_site(u, origin)]
+    seeds += [x['url'] for x in previous_items if x.get('watch_id') == source['id'] and allowed_same_site(x.get('url', ''), origin)]
+    seeds.append(origin + '/')
+    # First two distinct known pages; never guess a year-specific URL.
+    for url in dict.fromkeys(seeds):
+        if allowed_same_site(url, origin):
+            queue.append((url.split('#')[0], 'known_page'))
+        if len(queue) >= 2:
+            break
+    requests_used = 0
+    def read(url, method):
+        nonlocal requests_used
+        if requests_used >= budget or url in checked:
+            return None
+        checked.add(url)
+        requests_used += 1
+        try:
+            body, mime, final_url = fetcher.get(url)
+            # Redirects must not expand the approved source scope for content analysis.
+            if not allowed_same_site(final_url, origin):
+                raise ValueError('Redirect left the known source host; manual approval required')
+            checks.append({'id':'recovery-'+digest(url), 'name':source['name'], 'url':url, 'status':'ok', 'method':method, 'checked_at':timestamp})
+            return body, mime, final_url
+        except Exception as exc:
+            checks.append({'id':'recovery-'+digest(url), 'name':source['name'], 'url':url, 'status':'failed', 'method':method, 'checked_at':timestamp, 'error':str(exc)[:240]})
+            return None
+    def analyze_page(url, method):
+        result = read(url, method)
+        if result is None:
+            return [], []
+        body, mime, final_url = result
+        if mime not in ('text/html','application/xhtml+xml'):
+            checks[-1]['status'] = 'failed'
+            checks[-1]['error'] = 'Unsupported content: HTML required; no automatic PDF/JS bypass'
+            return [], []
+        page = EventHTML()
+        page.feed(body)
+        text = normalized(' '.join(page.text))
+        # Old year in a title or robots/HTTP errors never establishes a 2027 event.
+        if '2027' in text and not excluded(normalized(page.title)+' '+text[:600], plan):
+            matches.append({'url':final_url, 'title':normalized(page.title)[:200] or source['name'], 'checked_at':timestamp, 'method':method, 'status':'accessible_2027_mention'})
+            for obj in page.json_scripts:
+                for event in walk_events(obj):
+                    found = structured_item(event, source, final_url, plan, timestamp)
+                    if found:
+                        found['retrieval_method'] = method
+                        found['review_required'] = True
+                        found['review_reasons'].append('대체 경로 출처·본행사/세션 구분 확인 필요')
+                        items.append(found)
+            position = text.find('2027')
+            items.append({'id':'page-'+digest(final_url), 'title':normalized(page.title)[:200] or source['name'],
+                          'url':final_url, 'source_url':final_url, 'watch_id':source['id'], 'watch_name':source['name'],
+                          'priority':source['priority'], 'region':'현행 개최지 미확인', 'historical_region':source['region'],
+                          'event_date':'', 'end_date':'', 'source_kind':'official_page_change', 'kind':'대체 링크 발견',
+                          'review_required':True, 'review_reasons':['알려진 출처의 접근 가능한 링크에 2027 언급: 개최일·금융 연관성 검수 필요'],
+                          'scope':'unknown', 'summary':text[max(0,position-120):position+480], 'page_fingerprint':digest(text),
+                          'retrieval_method':method, 'speakers':[], 'observed_at':timestamp,
+                          'evidence':'알려진 출처의 본문 접근 성공과 2027 언급만 확인. 행사 개최·공식성·스피커 확정을 의미하지 않음.'})
+        ranked = []
+        for href, label in page.links:
+            dest = parse.urljoin(final_url, href).split('#')[0]
+            if not allowed_same_site(dest, origin) or dest.lower().split('?')[0].endswith(('.pdf','.zip','.jpg','.png','.js','.css')):
+                continue
+            score = candidate_link_score(dest, label, source, titles)
+            if score >= 4:
+                ranked.append((score, dest, 'fallback_link'))
+        public_feeds = [parse.urljoin(final_url, href) for href in page.feeds]
+        return ranked, [u for u in public_feeds if allowed_same_site(u, origin)]
+    ranked, public_feeds = [], []
+    for url, method in queue:
+        links, feeds = analyze_page(url, method)
+        ranked.extend(links)
+        public_feeds.extend(feeds)
+    # The site's own advertised RSS/Atom is checked, not an unauthorised search API.
+    for url in list(dict.fromkeys(public_feeds))[:1]:
+        result = read(url, 'site_feed')
+        if result:
+            try:
+                for href, label in feed_links(result[0]):
+                    dest = parse.urljoin(url, href)
+                    if allowed_same_site(dest, origin):
+                        score = candidate_link_score(dest, label, source, titles)
+                        if score >= 4:
+                            ranked.append((score, dest, 'site_feed_link'))
+            except Exception as exc:
+                checks[-1].update(status='failed',error='Feed parse failed: '+str(exc)[:180])
+    # Sitemap paths come from robots where available; /sitemap.xml is a checked probe,
+    # never an asserted accessible or 2027 page until an actual successful read.
+    rp = getattr(fetcher, 'robots', {}).get(origin)
+    if rp is not None:
+        maps.extend(rp.site_maps() or [])
+    maps.append(origin+'/sitemap.xml')
+    if requests_used < budget-1:
+        for sitemap in dict.fromkeys(maps):
+            if not allowed_same_site(sitemap, origin):
+                continue
+            result = read(sitemap, 'sitemap')
+            if result:
+                try:
+                    index, locs = xml_locations(result[0])
+                    if index:
+                        children = sorted((u for u in locs if allowed_same_site(u, origin)), key=lambda u:candidate_link_score(u,'',source,titles),reverse=True)
+                        if children and requests_used < budget-1:
+                            nested = read(children[0], 'sitemap')
+                            if nested:
+                                _, locs = xml_locations(nested[0])
+                    for dest in locs:
+                        if allowed_same_site(dest, origin):
+                            score = candidate_link_score(dest,'',source,titles)
+                            if score >= 4:
+                                ranked.append((score,dest,'sitemap_link'))
+                except Exception as exc:
+                    checks[-1].update(status='failed',error='Sitemap parse failed: '+str(exc)[:160])
+            break
+    for _, url, method in sorted(set(ranked), reverse=True):
+        if requests_used >= budget or len(matches) >= max_matches:
+            break
+        if url not in checked:
+            analyze_page(url, method)
+    unique_matches = list({x['url']:x for x in matches}.values())
+    state = 'found' if unique_matches else 'checked_no_match' if any(x['status']=='ok' for x in checks) else 'failed'
+    summary = {'watch_id':source['id'], 'name':source['name'], 'status':state, 'checks':len(checks), 'accessible_links':unique_matches,
+               'note':'제목·알려진 출처 범위의 대체 탐색. 광범위한 뉴스 검색 복구가 아니며 2027 언급만으로 행사 확정 금지.'}
+    return items, checks, summary
+
+
 def atomic_write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix('.tmp')
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
     temp.replace(path)
+
+
+def manual_url(value):
+    """Reject credentials, queries and private/opaque addresses before any target request."""
+    if not isinstance(value, str) or len(value) > 2000:
+        raise ValueError('Public URL must be at most 2000 characters')
+    p = parse.urlsplit(value.strip())
+    if p.query or p.fragment:
+        raise ValueError('Remove query/fragment; never submit signed or private URLs')
+    return public_url(value.strip())
+
+
+def collect_target(url, fetcher, plan, timestamp):
+    """Owner-dispatched single HTML page. No automatic enrollment or inferred people."""
+    items = []
+    safe_target = ''
+    try:
+        url = manual_url(url)
+        safe_target = url
+        html, mime, final_url = fetcher.get(url)
+        manual_url(final_url)
+        if mime not in ('text/html', 'application/xhtml+xml'):
+            raise ValueError('HTML only; PDF/image/JavaScript speaker lists need manual review')
+        page = EventHTML(); page.feed(html)
+        source = {'id':'manual-'+digest(url), 'name':normalized(page.title)[:160] or '지정 URL 조사', 'aliases':[], 'priority':'A', 'region':'현행 개최지 미확인'}
+        for event in list(walk_events(page.json_scripts))[:20]:
+            item = structured_item(event, source, final_url, plan, timestamp)
+            if item:
+                item['id'] = 'manual-'+digest(final_url+'|'+item['title'])
+                item['requested_url'] = url
+                item['manual_request'] = True
+                item['review_required'] = True
+                item['review_reasons'].append('사용자 지정 URL: 공식성·현행 연도·연사 참석·소속을 직접 검수해야 함')
+                item['evidence'] = '사용자 지정 공개 HTML의 Event/performer 구조화 정보. 출처 공식성·참석 확정 아님.'
+                items.append(item)
+        if not items:
+            items.append({'id':'manual-page-'+digest(final_url), 'title':source['name'], 'url':final_url, 'source_url':final_url,
+                          'requested_url':url, 'manual_request':True, 'watch_id':source['id'], 'watch_name':source['name'], 'priority':'A',
+                          'region':'현행 개최지 미확인', 'event_date':'', 'end_date':'', 'source_kind':'official_page_change',
+                          'kind':'지정 URL 조사', 'review_required':True, 'review_reasons':['구조화된 Event/performer 없음: 본문을 직접 검수하고 행사·연사를 수동 입력해야 함'],
+                          'scope':'unknown', 'summary':normalized(' '.join(page.text))[:1800], 'speakers':[], 'observed_at':timestamp,
+                          'evidence':'지정 URL의 HTML 본문 발췌. 날짜·연사·공식성을 추정하여 채우지 않음.'})
+        check = {'id':'target-'+digest(url), 'name':'지정 URL 조사', 'url':url, 'status':'ok', 'method':'manual_url', 'checked_at':timestamp, 'count':len(items)}
+    except Exception as exc:
+        check = {'id':'target-'+digest(url), 'name':'지정 URL 조사', 'url':safe_target, 'status':'failed', 'method':'manual_url', 'checked_at':timestamp, 'error':str(exc)[:240]}
+    return items, check
+
+
+def run_target(url, previous, fetcher, plan, timestamp, private):
+    found, check = collect_target(url, fetcher, plan, timestamp)
+    items, changes = merge_items(previous['items'], found, timestamp)
+    ok = check['status'] == 'ok'
+    record = {'id':digest(timestamp), 'mode':'target_url', 'target_url':check['url'], 'started_at':timestamp, 'finished_at':now(),
+              'status':'success' if ok else 'failed', 'checked':1, 'succeeded':int(ok), 'failed':int(not ok),
+              'new':sum(c['change']=='new' for c in changes), 'updated':sum(c['change']=='updated' for c in changes), 'checks':[check]}
+    runs = [record]+previous.get('runs', [])[:27]
+    # Do not advance the last full-monitoring success timestamp for a one-page request.
+    feed = {'version':1, 'collector_version':'3.0', 'generated_at':record['finished_at'], 'last_success_at':previous.get('last_success_at'),
+            'timezone':plan['timezone'], 'schedule':plan['schedule'], 'scope':plan['scope'], 'publisher':'RWA Radar owner-requested URL research',
+            'run':record, 'runs':runs, 'items':items[:plan['collection']['max_items']],
+            'limitations':['지정 URL 한 페이지만 조사한 결과이며 전체 모니터링의 복구·성공을 의미하지 않습니다.', 'HTML/JSON-LD Event와 performer만 추출합니다. 검수 후 선택 등록해야 합니다.']}
+    atomic_write(ROOT/'public-feed/monitor-feed.json', feed)
+    atomic_write(ROOT/'public-feed/monitor-plan.json', plan)
+    atomic_write(private, {**previous, 'items':items, 'runs':runs})
+    (ROOT/'public-feed/index.html').write_text('<!doctype html><meta charset="utf-8"><title>RWA Radar public feed</title><a href="monitor-feed.json">Public research feed</a>', encoding='utf-8')
+    print(json.dumps({'mode':'target_url', 'status':record['status'], 'new':record['new'], 'updated':record['updated']}))
 
 
 def run():
@@ -364,6 +733,10 @@ def run():
         previous = {'items': [], 'runs': [], 'page_hashes': {}}
     timestamp = now()
     fetcher = Fetcher(plan['collection'])
+    target_url = os.environ.get('RADAR_TARGET_URL', '').strip()
+    if target_url:
+        fetcher.opener = request.build_opener(TargetRedirect())
+        return run_target(target_url, previous, fetcher, plan, timestamp, private)
     incoming, checks = [], []
     tasks = [(g['query'], g['language'], g['name'], None) for g in plan['keyword_groups']]
     for source in plan['watchlist']:
@@ -380,12 +753,44 @@ def run():
             except Exception as exc:
                 checks.append({'id': 'rss-'+digest(query), 'name': label, 'url': '', 'status': 'failed', 'method': 'rss', 'checked_at': timestamp, 'error': str(exc)[:240]})
     hashes = dict(previous.get('page_hashes', {}))
+    recovery_records = []
+    news_records = []
+    news_config = plan.get('public_news_api', {})
+    if news_config.get('enabled',False):
+        for index, query in enumerate(news_config.get('queries',[])[:2]):
+            if index:
+                time.sleep(max(5,int(news_config.get('min_interval_seconds',5))))
+            try:
+                found, rows, summary = collect_public_news(query, fetcher, plan, timestamp)
+                incoming.extend(found);checks.extend(rows);news_records.append(summary)
+            except Exception as exc:
+                checks.append({'id':'news-api-'+digest(query),'name':'GDELT 공개 뉴스 API','url':'','status':'failed','method':'news_api','checked_at':timestamp,'error':str(exc)[:220]})
+                news_records.append({'provider':'GDELT Doc API','query':query,'status':'failed','count':0,'originals_accessed':0,'note':str(exc)[:220]})
     for source in plan['watchlist']:
         if source.get('direct'):
             found, rows, updated = collect_direct(source, fetcher, plan, timestamp, hashes)
             incoming.extend(found)
             checks.extend(rows)
             hashes.update(updated)
+    # RSS failure is retained. Recover ONLY inside known sites; never claim global
+    # keyword/news search has recovered merely because a known site is accessible.
+    recovery_config = plan.get('recovery', {})
+    cursor = int(previous.get('recovery_cursor', 0))
+    if recovery_config.get('enabled', True):
+        failed_watch_ids = {source['id'] for query, language, label, source in tasks if source and any(c['id']=='rss-'+digest(query) and c['status']!='ok' for c in checks)}
+        eligible = [s for s in plan['watchlist'] if s['id'] in failed_watch_ids]
+        if eligible:
+            start = cursor % len(eligible)
+            ordered = eligible[start:] + eligible[:start]
+            limit = min(len(ordered), int(recovery_config.get('max_groups_per_run', 8)))
+            selected = ordered[:limit]
+            for source in selected:
+                found, rows, summary = collect_recovery(source, fetcher, plan, timestamp, previous['items']+incoming)
+                incoming.extend(found)
+                checks.extend(rows)
+                recovery_records.append(summary)
+            recovery_records.extend({'watch_id':s['id'],'name':s['name'],'status':'not_attempted','checks':0,'accessible_links':[],'note':'실행당 예산에 따른 순환 대기. 접근 성공으로 간주하지 않음.'} for s in ordered[limit:])
+            cursor += limit
     # A URL found by several searches is not several events; prefer the first exact item ID.
     unique = {}
     for item in sorted(incoming, key=lambda x: (x['id'], x['priority'], x['watch_id'])):
@@ -399,7 +804,7 @@ def run():
                   'new': sum(c['change']=='new' for c in changes), 'updated': sum(c['change']=='updated' for c in changes), 'checks': checks}
     runs = [run_record] + previous.get('runs', [])[:27]
     last_success = run_record['finished_at'] if status == 'success' else previous.get('last_success_at')
-    feed = {'version': 1, 'generated_at': run_record['finished_at'], 'last_success_at': last_success,
+    feed = {'version': 1, 'collector_version':'3.0', 'recovery':recovery_records, 'public_news':news_records, 'global_news_search':'Google 뉴스 RSS 실패는 보존. 별도 공개 뉴스 색인 및 알려진 출처 내부의 대체 탐색만 수행', 'generated_at': run_record['finished_at'], 'last_success_at': last_success,
             'timezone': plan['timezone'], 'schedule': plan['schedule'], 'scope': plan['scope'],
             'publisher': 'RWA Radar scheduled collector', 'run': run_record, 'runs': runs,
             'items': items[:plan['collection']['max_items']],
@@ -407,7 +812,7 @@ def run():
             'limitations': ['RSS는 후보 탐색이며 공식 원문 검수가 필요합니다.', 'HTML/JSON-LD만 수집합니다. JS 렌더링·이미지·PDF 연사 명단은 사람이 확인해야 합니다.', '예약 실행은 GitHub 서비스 상황에 따라 지연·누락될 수 있습니다.']}
     atomic_write(ROOT/'public-feed/monitor-feed.json', feed)
     atomic_write(ROOT/'public-feed/monitor-plan.json', plan)
-    atomic_write(private, {'items': items, 'runs': runs, 'page_hashes': hashes, 'last_success_at': last_success})
+    atomic_write(private, {**previous, 'items': items, 'runs': runs, 'page_hashes': hashes, 'last_success_at': last_success, 'recovery_cursor':cursor})
     (ROOT/'public-feed/index.html').write_text('<!doctype html><meta charset="utf-8"><title>RWA Radar public research feed</title><h1>RWA Radar 공개 리서치 피드</h1><p>개인 섭외 메모는 포함하지 않습니다. 자동 발견은 행사 확정을 뜻하지 않습니다.</p><a href="monitor-feed.json">monitor-feed.json</a>', encoding='utf-8')
     print(json.dumps({'status': status, 'checks': len(checks), 'failed': len(checks)-ok, 'new': run_record['new'], 'updated': run_record['updated']}, ensure_ascii=False))
 
